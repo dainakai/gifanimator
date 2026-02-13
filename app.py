@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from collections import OrderedDict
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,6 +10,11 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from PIL import Image, ImageSequence, ImageTk
+
+try:
+    RESAMPLE_FILTER = Image.Resampling.BILINEAR
+except AttributeError:
+    RESAMPLE_FILTER = Image.BILINEAR
 
 
 @dataclass
@@ -19,6 +25,7 @@ class GifEntry:
 
 
 class GifAnimatorApp:
+    FRAME_CACHE_LIMIT = 120
     SORT_OPTIONS = (
         "Name (A-Z)",
         "Name (Z-A)",
@@ -37,11 +44,14 @@ class GifAnimatorApp:
         self.gif_entries: list[GifEntry] = []
 
         self.pil_frames: list[Image.Image] = []
-        self.tk_frames: list[ImageTk.PhotoImage] = []
         self.frame_durations_ms: list[int] = []
         self.current_frame_index = 0
         self.playing = False
         self.playback_after_id: Optional[str] = None
+        self.resize_after_id: Optional[str] = None
+        self.preview_render_cache: OrderedDict[tuple[int, int, int], ImageTk.PhotoImage] = OrderedDict()
+        self.preview_size = (0, 0)
+        self.current_photo: Optional[ImageTk.PhotoImage] = None
 
         self.speed_var = tk.DoubleVar(value=1.0)
         self.sort_var = tk.StringVar(value=self.SORT_OPTIONS[0])
@@ -129,6 +139,7 @@ class GifAnimatorApp:
 
         self.image_label = ttk.Label(viewer, anchor="center")
         self.image_label.grid(row=0, column=0, sticky="nsew")
+        self.image_label.bind("<Configure>", self._on_preview_resize)
 
         controls = ttk.Frame(viewer)
         controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -210,11 +221,11 @@ class GifAnimatorApp:
         self.current_directory = self.current_file.parent
         self.pil_frames = pil_frames
         self.frame_durations_ms = durations
-        self.tk_frames = [ImageTk.PhotoImage(frame) for frame in self.pil_frames]
+        self._clear_preview_cache()
         self.current_frame_index = 0
 
-        self._set_slider_bounds(len(self.tk_frames))
-        self.show_frame(0)
+        self._set_slider_bounds(len(self.pil_frames))
+        self.show_frame(0, force=True)
         self.refresh_file_list()
         self._select_current_file_in_tree()
         self.status_var.set(f"Loaded: {self.current_file}")
@@ -230,7 +241,7 @@ class GifAnimatorApp:
             base_duration = int(img.info.get("duration", 100))
             for frame in ImageSequence.Iterator(img):
                 frame_duration = int(frame.info.get("duration", base_duration or 100))
-                frames.append(frame.convert("RGBA"))
+                frames.append(frame.copy())
                 durations.append(max(20, frame_duration))
 
         if not frames:
@@ -245,35 +256,98 @@ class GifAnimatorApp:
         self.frame_slider.set(0)
         self._updating_slider = False
 
-    def show_frame(self, index: int) -> None:
-        if not self.tk_frames:
+    def _clear_preview_cache(self) -> None:
+        self.preview_render_cache.clear()
+
+    def _fit_frame_to_preview(self, frame: Image.Image, preview_size: tuple[int, int]) -> Image.Image:
+        width, height = preview_size
+        src_w, src_h = frame.size
+        if src_w <= 0 or src_h <= 0:
+            return frame
+
+        scale = min(width / src_w, height / src_h)
+        target_w = max(1, int(src_w * scale))
+        target_h = max(1, int(src_h * scale))
+        if target_w == src_w and target_h == src_h:
+            return frame
+        return frame.resize((target_w, target_h), RESAMPLE_FILTER)
+
+    def _get_preview_size(self) -> tuple[int, int]:
+        width = self.image_label.winfo_width()
+        height = self.image_label.winfo_height()
+        if width <= 1 or height <= 1:
+            return (640, 480)
+        return (width, height)
+
+    def _get_or_create_photo(self, frame_index: int) -> ImageTk.PhotoImage:
+        preview_size = self._get_preview_size()
+        cache_key = (frame_index, preview_size[0], preview_size[1])
+        cached = self.preview_render_cache.get(cache_key)
+        if cached is not None:
+            self.preview_render_cache.move_to_end(cache_key)
+            return cached
+
+        frame = self.pil_frames[frame_index]
+        if frame.mode not in ("RGB", "RGBA"):
+            frame = frame.convert("RGBA")
+        resized_frame = self._fit_frame_to_preview(frame, preview_size)
+        photo = ImageTk.PhotoImage(resized_frame)
+        self.preview_render_cache[cache_key] = photo
+        self.preview_render_cache.move_to_end(cache_key)
+        while len(self.preview_render_cache) > self.FRAME_CACHE_LIMIT:
+            self.preview_render_cache.popitem(last=False)
+        return photo
+
+    def show_frame(self, index: int, force: bool = False) -> None:
+        if not self.pil_frames:
             return
 
-        index = max(0, min(index, len(self.tk_frames) - 1))
+        index = max(0, min(index, len(self.pil_frames) - 1))
+        if not force and index == self.current_frame_index and self.current_photo is not None:
+            return
+
         self.current_frame_index = index
-        self.image_label.configure(image=self.tk_frames[index])
-        self.image_label.image = self.tk_frames[index]
+        photo = self._get_or_create_photo(index)
+        self.current_photo = photo
+        self.image_label.configure(image=photo)
+        self.image_label.image = photo
 
         self._updating_slider = True
         self.frame_slider.set(index)
         self._updating_slider = False
 
-        self.frame_info_var.set(f"Frame: {index + 1} / {len(self.tk_frames)}")
+        self.frame_info_var.set(f"Frame: {index + 1} / {len(self.pil_frames)}")
+
+    def _on_preview_resize(self, event: tk.Event) -> None:
+        new_size = (max(1, event.width), max(1, event.height))
+        if new_size == self.preview_size:
+            return
+
+        self.preview_size = new_size
+        self._clear_preview_cache()
+        if self.resize_after_id is not None:
+            self.root.after_cancel(self.resize_after_id)
+        self.resize_after_id = self.root.after(80, self._rerender_current_frame)
+
+    def _rerender_current_frame(self) -> None:
+        self.resize_after_id = None
+        if self.pil_frames:
+            self.show_frame(self.current_frame_index, force=True)
 
     def step_frame(self, delta: int) -> None:
-        if not self.tk_frames:
+        if not self.pil_frames:
             return
-        next_index = (self.current_frame_index + delta) % len(self.tk_frames)
+        next_index = (self.current_frame_index + delta) % len(self.pil_frames)
         self.show_frame(next_index)
 
     def _on_slider_change(self, value: str) -> None:
-        if self._updating_slider or not self.tk_frames:
+        if self._updating_slider or not self.pil_frames:
             return
         frame_index = int(float(value))
         self.show_frame(frame_index)
 
     def play(self) -> None:
-        if not self.tk_frames:
+        if not self.pil_frames:
             return
         if self.playing:
             return
@@ -287,7 +361,7 @@ class GifAnimatorApp:
             self.playback_after_id = None
 
     def _schedule_next_frame(self) -> None:
-        if not self.playing or not self.tk_frames:
+        if not self.playing or not self.pil_frames:
             return
 
         speed = self.speed_var.get() or 1.0
@@ -296,9 +370,9 @@ class GifAnimatorApp:
         self.playback_after_id = self.root.after(delay, self._playback_tick)
 
     def _playback_tick(self) -> None:
-        if not self.playing or not self.tk_frames:
+        if not self.playing or not self.pil_frames:
             return
-        next_index = (self.current_frame_index + 1) % len(self.tk_frames)
+        next_index = (self.current_frame_index + 1) % len(self.pil_frames)
         self.show_frame(next_index)
         self._schedule_next_frame()
 
