@@ -1,0 +1,2 @@
+# 使い方
+pillowとtkinterが動くPython環境を用意してください。

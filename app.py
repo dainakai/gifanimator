@@ -26,6 +26,8 @@ class GifEntry:
 
 class GifAnimatorApp:
     FRAME_CACHE_LIMIT = 120
+    MIN_FRAME_DELAY_MS = 30
+    RESIZE_EPSILON_PX = 2
     SORT_OPTIONS = (
         "Name (A-Z)",
         "Name (Z-A)",
@@ -84,6 +86,7 @@ class GifAnimatorApp:
         sidebar.rowconfigure(2, weight=1)
 
         open_btn = ttk.Button(sidebar, text="GIFを開く", command=self.select_gif_file)
+        self._enable_press_to_activate(open_btn, self.select_gif_file)
         open_btn.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         sort_row = ttk.Frame(sidebar)
@@ -127,8 +130,10 @@ class GifAnimatorApp:
         nav_row.columnconfigure(1, weight=1)
 
         prev_file_btn = ttk.Button(nav_row, text="Prev File", command=lambda: self.open_adjacent_file(-1))
+        self._enable_press_to_activate(prev_file_btn, lambda: self.open_adjacent_file(-1))
         prev_file_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         next_file_btn = ttk.Button(nav_row, text="Next File", command=lambda: self.open_adjacent_file(1))
+        self._enable_press_to_activate(next_file_btn, lambda: self.open_adjacent_file(1))
         next_file_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
     def _build_viewer(self, parent: ttk.Frame) -> None:
@@ -149,12 +154,16 @@ class GifAnimatorApp:
         playback_row.grid(row=0, column=0, columnspan=2, sticky="ew")
 
         self.play_btn = ttk.Button(playback_row, text="再生", command=self.play)
+        self._enable_press_to_activate(self.play_btn, self.play)
         self.play_btn.grid(row=0, column=0, sticky="ew")
         self.pause_btn = ttk.Button(playback_row, text="停止", command=self.pause)
+        self._enable_press_to_activate(self.pause_btn, self.pause)
         self.pause_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         prev_frame_btn = ttk.Button(playback_row, text="◀", width=4, command=lambda: self.step_frame(-1))
+        self._enable_press_to_activate(prev_frame_btn, lambda: self.step_frame(-1))
         prev_frame_btn.grid(row=0, column=2, sticky="ew", padx=(12, 0))
         next_frame_btn = ttk.Button(playback_row, text="▶", width=4, command=lambda: self.step_frame(1))
+        self._enable_press_to_activate(next_frame_btn, lambda: self.step_frame(1))
         next_frame_btn.grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
         speed_frame = ttk.Frame(playback_row)
@@ -182,12 +191,31 @@ class GifAnimatorApp:
         self.frame_info_var = tk.StringVar(value="Frame: - / -")
         ttk.Label(info_row, textvariable=self.frame_info_var).grid(row=0, column=0, sticky="w")
         save_frame_btn = ttk.Button(info_row, text="現在フレームを保存", command=self.save_current_frame)
+        self._enable_press_to_activate(save_frame_btn, self.save_current_frame)
         save_frame_btn.grid(row=0, column=1, sticky="e")
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Left>", lambda _: self.step_frame(-1))
         self.root.bind("<Right>", lambda _: self.step_frame(1))
         self.root.bind("<space>", self._toggle_play_pause)
+
+    def _enable_press_to_activate(self, button: ttk.Button, callback) -> None:
+        # tkinter の標準ボタンは release 時に command 実行されるため、
+        # 描画負荷が高い場面でも押下だけで反応するよう補助する。
+        def on_press(event: tk.Event) -> str:
+            if "disabled" in button.state():
+                return "break"
+            button.state(["pressed"])
+            self.root.after_idle(callback)
+            return "break"
+
+        def on_release(_: tk.Event) -> str:
+            button.state(["!pressed"])
+            return "break"
+
+        button.bind("<ButtonPress-1>", on_press, add="+")
+        button.bind("<ButtonRelease-1>", on_release, add="+")
+        button.bind("<Leave>", lambda _: button.state(["!pressed"]), add="+")
 
     def _toggle_play_pause(self, _: tk.Event) -> None:
         if self.playing:
@@ -320,8 +348,11 @@ class GifAnimatorApp:
 
     def _on_preview_resize(self, event: tk.Event) -> None:
         new_size = (max(1, event.width), max(1, event.height))
-        if new_size == self.preview_size:
-            return
+        if self.preview_size != (0, 0):
+            width_delta = abs(new_size[0] - self.preview_size[0])
+            height_delta = abs(new_size[1] - self.preview_size[1])
+            if width_delta <= self.RESIZE_EPSILON_PX and height_delta <= self.RESIZE_EPSILON_PX:
+                return
 
         self.preview_size = new_size
         self._clear_preview_cache()
@@ -366,7 +397,7 @@ class GifAnimatorApp:
 
         speed = self.speed_var.get() or 1.0
         delay = int(self.frame_durations_ms[self.current_frame_index] / speed)
-        delay = max(20, delay)
+        delay = max(self.MIN_FRAME_DELAY_MS, delay)
         self.playback_after_id = self.root.after(delay, self._playback_tick)
 
     def _playback_tick(self) -> None:
