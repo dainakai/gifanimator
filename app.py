@@ -12,10 +12,29 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 from PIL import Image, ImageSequence, ImageTk
 
 import tkinter.font as tkfont
+
+if not hasattr(tk, "tix"):
+    class _CompatTixModule:
+        class Tk(tk.Tk):
+            pass
+
+    tk.tix = _CompatTixModule  # type: ignore[attr-defined]
+
+try:
+    from tkinterdnd2 import COPY, DND_FILES, NONE, TkinterDnD
+
+    DND_IMPORT_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    COPY = "copy"
+    DND_FILES = "DND_Files"
+    NONE = "none"
+    TkinterDnD = None
+    DND_IMPORT_AVAILABLE = False
 
 
 def _find_available_font_family(root: tk.Tk, candidates: tuple[str, ...]) -> Optional[str]:
@@ -278,8 +297,10 @@ class GifAnimatorApp:
 
         # リサイズ検出の閾値もスケールさせる（高 DPI で過敏になりすぎないように）
         self.resize_epsilon_px = max(2, self.s(self.RESIZE_EPSILON_PX))
+        self.dnd_enabled = False
 
         self._build_ui()
+        self._configure_drag_and_drop()
         self._bind_shortcuts()
 
     def _build_ui(self) -> None:
@@ -421,7 +442,33 @@ class GifAnimatorApp:
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Left>", lambda _: self.step_frame(-1))
         self.root.bind("<Right>", lambda _: self.step_frame(1))
+        self.root.bind("<Up>", lambda _: self.open_adjacent_file(-1))
+        self.root.bind("<Down>", lambda _: self.open_adjacent_file(1))
         self.root.bind("<space>", self._toggle_play_pause)
+
+    def _configure_drag_and_drop(self) -> None:
+        if not DND_IMPORT_AVAILABLE:
+            return
+
+        if not hasattr(self.root, "drop_target_register"):
+            return
+
+        try:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<DropEnter>>", self._on_drop_enter, add="+")
+            self.root.dnd_bind("<<DropPosition>>", self._on_drop_position, add="+")
+            self.root.dnd_bind("<<Drop>>", self._on_drop_files, add="+")
+
+            self.image_label.drop_target_register(DND_FILES)
+            self.image_label.dnd_bind("<<DropEnter>>", self._on_drop_enter, add="+")
+            self.image_label.dnd_bind("<<DropPosition>>", self._on_drop_position, add="+")
+            self.image_label.dnd_bind("<<Drop>>", self._on_drop_files, add="+")
+
+            self.image_label.drag_source_register(1, DND_FILES)
+            self.image_label.dnd_bind("<<DragInitCmd>>", self._on_drag_init, add="+")
+            self.dnd_enabled = True
+        except tk.TclError:
+            self.dnd_enabled = False
 
     def _enable_press_to_activate(self, button: ttk.Button, callback) -> None:
         # tkinter の標準ボタンは release 時に command 実行されるため、
@@ -441,11 +488,73 @@ class GifAnimatorApp:
         button.bind("<ButtonRelease-1>", on_release, add="+")
         button.bind("<Leave>", lambda _: button.state(["!pressed"]), add="+")
 
-    def _toggle_play_pause(self, _: tk.Event) -> None:
+    def _split_dnd_items(self, raw_data: str) -> list[str]:
+        if not raw_data:
+            return []
+
+        try:
+            return [item for item in self.root.tk.splitlist(raw_data) if item]
+        except tk.TclError:
+            return [raw_data]
+
+    def _coerce_dropped_item_to_path(self, item: str) -> Optional[Path]:
+        value = item.strip()
+        if not value:
+            return None
+
+        parsed = urlparse(value)
+        if parsed.scheme == "file":
+            path_text = unquote(parsed.path or "")
+            if parsed.netloc and parsed.netloc != "localhost":
+                path_text = f"//{parsed.netloc}{path_text}"
+            if sys.platform.startswith("win") and re.match(r"^/[A-Za-z]:", path_text):
+                path_text = path_text[1:]
+            value = path_text
+
+        return Path(value)
+
+    def _find_dropped_gif(self, raw_data: str) -> Optional[Path]:
+        for item in self._split_dnd_items(raw_data):
+            path = self._coerce_dropped_item_to_path(item)
+            if path is None:
+                continue
+
+            candidate = path.expanduser()
+            if candidate.suffix.lower() != ".gif":
+                continue
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            return candidate.resolve()
+        return None
+
+    def _on_drop_enter(self, _: object) -> str:
+        return COPY
+
+    def _on_drop_position(self, _: object) -> str:
+        return COPY
+
+    def _on_drop_files(self, event: object) -> str:
+        dropped_gif = self._find_dropped_gif(getattr(event, "data", ""))
+        if dropped_gif is None:
+            self.status_var.set("GIFファイルをドロップしてください。")
+            return NONE
+
+        self.load_gif(dropped_gif)
+        return COPY
+
+    def _on_drag_init(self, _: object) -> tuple[str, str, str]:
+        if self.current_file is None or not self.current_file.exists():
+            return (NONE, DND_FILES, "")
+
+        dnd_data = self.root.tk.call("list", str(self.current_file))
+        return (COPY, DND_FILES, dnd_data)
+
+    def _toggle_play_pause(self, _: tk.Event) -> str:
         if self.playing:
             self.pause()
         else:
             self.play()
+        return "break"
 
     def select_gif_file(self) -> None:
         initial_dir = str(self.current_directory) if self.current_directory else str(Path.cwd())
@@ -734,7 +843,13 @@ class GifAnimatorApp:
 
 
 def main() -> None:
-    root = tk.Tk()
+    if DND_IMPORT_AVAILABLE and TkinterDnD is not None:
+        try:
+            root = TkinterDnD.Tk()
+        except (RuntimeError, tk.TclError):
+            root = tk.Tk()
+    else:
+        root = tk.Tk()
 
     ui_scale = configure_hidpi(root)
     ui_font_family = _select_ui_font_family(root)
