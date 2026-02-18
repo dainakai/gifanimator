@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -13,28 +14,90 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 from urllib.parse import unquote, urlparse
+import types
 
 from PIL import Image, ImageSequence, ImageTk
 
 import tkinter.font as tkfont
 
 if not hasattr(tk, "tix"):
-    class _CompatTixModule:
-        class Tk(tk.Tk):
-            pass
+    compat_tix = types.ModuleType("tkinter.tix")
 
-    tk.tix = _CompatTixModule  # type: ignore[attr-defined]
+    class _CompatTixTk(tk.Tk):
+        pass
 
+    compat_tix.Tk = _CompatTixTk
+    sys.modules["tkinter.tix"] = compat_tix
+    tk.tix = compat_tix  # type: ignore[attr-defined]
+
+DND_IMPORT_ERROR: Optional[Exception] = None
 try:
     from tkinterdnd2 import COPY, DND_FILES, NONE, TkinterDnD
-
-    DND_IMPORT_AVAILABLE = True
-except Exception:  # noqa: BLE001
+except Exception as exc:  # noqa: BLE001
+    DND_IMPORT_ERROR = exc
     COPY = "copy"
     DND_FILES = "DND_Files"
     NONE = "none"
     TkinterDnD = None
-    DND_IMPORT_AVAILABLE = False
+
+
+def _patch_tkdnd_loader_for_macos() -> None:
+    if sys.platform != "darwin" or TkinterDnD is None:
+        return
+    if getattr(TkinterDnD, "_gifanimator_macos_loader_patched", False):
+        return
+
+    original_require = TkinterDnD._require
+
+    def _patched_require(tkroot: tk.Misc) -> str:
+        try:
+            return original_require(tkroot)
+        except Exception as original_exc:  # noqa: BLE001
+            tk_patchlevel = str(tkroot.tk.call("info", "patchlevel"))
+            tk_major_text = tk_patchlevel.split(".", 1)[0]
+            tk_major = int(tk_major_text) if tk_major_text.isdigit() else 0
+
+            module_base = Path(TkinterDnD.__file__).resolve().parent / "tkdnd"
+            machine = platform.machine().lower()
+            if machine == "arm64":
+                candidate_dirs = [module_base / "osx-arm64"]
+            elif machine == "x86_64":
+                candidate_dirs = [module_base / "osx-x64"]
+            else:
+                raise RuntimeError(f"未対応の macOS アーキテクチャです: {machine}")
+
+            last_error: Exception = original_exc
+            for directory in candidate_dirs:
+                try:
+                    if not directory.is_dir():
+                        continue
+                    dylibs_all = sorted(directory.glob("lib*.dylib"))
+                    if tk_major >= 9:
+                        dylibs = [path for path in dylibs_all if "libtcl9tkdnd" in path.name]
+                    else:
+                        dylibs = [path for path in dylibs_all if "libtcl9tkdnd" not in path.name]
+                    if not dylibs:
+                        dylibs = dylibs_all
+                    if not dylibs:
+                        continue
+
+                    tkroot.tk.call("source", str(directory / "tkdnd.tcl"))
+                    tkroot.tk.call("tkdnd::initialise", str(directory), dylibs[-1].name, "Tkdnd")
+                    version = tkroot.tk.call("package", "require", "tkdnd")
+                    TkinterDnD.TkdndVersion = version
+                    return str(version)
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+
+            raise RuntimeError(
+                f"macOS 用 tkdnd の読み込みに失敗しました (arch={machine}, Tk={tk_patchlevel})。"
+            ) from last_error
+
+    TkinterDnD._require = _patched_require
+    TkinterDnD._gifanimator_macos_loader_patched = True
+
+
+_patch_tkdnd_loader_for_macos()
 
 
 def _find_available_font_family(root: tk.Tk, candidates: tuple[str, ...]) -> Optional[str]:
@@ -297,7 +360,6 @@ class GifAnimatorApp:
 
         # リサイズ検出の閾値もスケールさせる（高 DPI で過敏になりすぎないように）
         self.resize_epsilon_px = max(2, self.s(self.RESIZE_EPSILON_PX))
-        self.dnd_enabled = False
 
         self._build_ui()
         self._configure_drag_and_drop()
@@ -447,28 +509,27 @@ class GifAnimatorApp:
         self.root.bind("<space>", self._toggle_play_pause)
 
     def _configure_drag_and_drop(self) -> None:
-        if not DND_IMPORT_AVAILABLE:
-            return
-
-        if not hasattr(self.root, "drop_target_register"):
-            return
-
         try:
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind("<<DropEnter>>", self._on_drop_enter, add="+")
-            self.root.dnd_bind("<<DropPosition>>", self._on_drop_position, add="+")
-            self.root.dnd_bind("<<Drop>>", self._on_drop_files, add="+")
+            for widget in self._iter_widget_tree(self.root):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<DropEnter>>", self._on_drop_enter, add="+")
+                widget.dnd_bind("<<DropPosition>>", self._on_drop_position, add="+")
+                widget.dnd_bind("<<Drop>>", self._on_drop_files, add="+")
 
-            self.image_label.drop_target_register(DND_FILES)
-            self.image_label.dnd_bind("<<DropEnter>>", self._on_drop_enter, add="+")
-            self.image_label.dnd_bind("<<DropPosition>>", self._on_drop_position, add="+")
-            self.image_label.dnd_bind("<<Drop>>", self._on_drop_files, add="+")
-
+            # GIF の持ち出しはプレビュー画像から始める。
             self.image_label.drag_source_register(1, DND_FILES)
             self.image_label.dnd_bind("<<DragInitCmd>>", self._on_drag_init, add="+")
-            self.dnd_enabled = True
-        except tk.TclError:
-            self.dnd_enabled = False
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Drag and Drop の初期化に失敗しました。") from exc
+
+    def _iter_widget_tree(self, root_widget: tk.Misc) -> list[tk.Misc]:
+        widgets: list[tk.Misc] = [root_widget]
+        index = 0
+        while index < len(widgets):
+            widget = widgets[index]
+            index += 1
+            widgets.extend(widget.winfo_children())
+        return widgets
 
     def _enable_press_to_activate(self, button: ttk.Button, callback) -> None:
         # tkinter の標準ボタンは release 時に command 実行されるため、
@@ -843,13 +904,13 @@ class GifAnimatorApp:
 
 
 def main() -> None:
-    if DND_IMPORT_AVAILABLE and TkinterDnD is not None:
-        try:
-            root = TkinterDnD.Tk()
-        except (RuntimeError, tk.TclError):
-            root = tk.Tk()
-    else:
-        root = tk.Tk()
+    if DND_IMPORT_ERROR is not None or TkinterDnD is None:
+        raise RuntimeError(f"tkinterdnd2 の読み込みに失敗しました: {DND_IMPORT_ERROR}") from DND_IMPORT_ERROR
+
+    try:
+        root = TkinterDnD.Tk()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"TkDND の初期化に失敗しました: {exc}") from exc
 
     ui_scale = configure_hidpi(root)
     ui_font_family = _select_ui_font_family(root)
