@@ -2,19 +2,247 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import os
+import re
+import subprocess
+import sys
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 from PIL import Image, ImageSequence, ImageTk
+
+import tkinter.font as tkfont
+
+if not hasattr(tk, "tix"):
+    class _CompatTixModule:
+        class Tk(tk.Tk):
+            pass
+
+    tk.tix = _CompatTixModule  # type: ignore[attr-defined]
+
+try:
+    from tkinterdnd2 import COPY, DND_FILES, NONE, TkinterDnD
+
+    DND_IMPORT_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    COPY = "copy"
+    DND_FILES = "DND_Files"
+    NONE = "none"
+    TkinterDnD = None
+    DND_IMPORT_AVAILABLE = False
+
+
+def _find_available_font_family(root: tk.Tk, candidates: tuple[str, ...]) -> Optional[str]:
+    try:
+        available = {family.casefold(): family for family in tkfont.families(root)}
+    except tk.TclError:
+        return None
+
+    for candidate in candidates:
+        family = available.get(candidate.casefold())
+        if family:
+            return family
+    return None
+
+
+def _select_ui_font_family(root: tk.Tk) -> Optional[str]:
+    override = os.environ.get("GIF_ANIMATOR_FONT_FAMILY")
+    if override:
+        return _find_available_font_family(root, (override,))
+
+    if not sys.platform.startswith("linux"):
+        return None
+
+    return _find_available_font_family(
+        root,
+        (
+            "Noto Sans CJK JP",
+            "Noto Sans JP",
+            "Source Han Sans JP",
+            "Ubuntu",
+            "Cantarell",
+            "Noto Sans",
+            "DejaVu Sans",
+        ),
+    )
+
+
+def _select_fixed_font_family(root: tk.Tk) -> Optional[str]:
+    override = os.environ.get("GIF_ANIMATOR_FIXED_FONT_FAMILY")
+    if override:
+        return _find_available_font_family(root, (override,))
+
+    if not sys.platform.startswith("linux"):
+        return None
+
+    return _find_available_font_family(
+        root,
+        (
+            "Noto Sans Mono CJK JP",
+            "Source Han Code JP",
+            "Ubuntu Mono",
+            "DejaVu Sans Mono",
+        ),
+    )
+
+
+def apply_font_scaling(
+    root: tk.Tk,
+    text_scale: float,
+    min_abs_size: int = 10,
+    ui_font_family: Optional[str] = None,
+    fixed_font_family: Optional[str] = None,
+) -> None:
+    """
+    Tk の named font（TkDefaultFont 等）を text_scale 倍して更新する。
+    フォントサイズは、正なら point 指定、負なら pixel 指定なので符号を保って拡大する。
+    """
+    ui_font_names = (
+        "TkDefaultFont",
+        "TkTextFont",
+        "TkMenuFont",
+        "TkHeadingFont",
+        "TkCaptionFont",
+        "TkSmallCaptionFont",
+        "TkIconFont",
+        "TkTooltipFont",
+    )
+    fixed_font_names = ("TkFixedFont",)
+
+    for name in ui_font_names + fixed_font_names:
+        try:
+            f = tkfont.nametofont(name)
+        except tk.TclError:
+            continue
+
+        size = int(f.cget("size"))
+        if size == 0:
+            continue
+
+        abs_size = abs(size)
+        new_abs = max(min_abs_size, int(round(abs_size * text_scale)))
+        configure_kwargs = {"size": new_abs if size > 0 else -new_abs}
+        if name in fixed_font_names:
+            if fixed_font_family:
+                configure_kwargs["family"] = fixed_font_family
+        elif ui_font_family:
+            configure_kwargs["family"] = ui_font_family
+        f.configure(**configure_kwargs)
+
+    # ttk の一部テーマでフォントが固定される場合の保険（基本は named font 更新だけで足ります）
+    try:
+        style = ttk.Style(root)
+        style.configure(".", font=tkfont.nametofont("TkDefaultFont"))
+        style.configure("Treeview", font=tkfont.nametofont("TkDefaultFont"))
+        style.configure("Treeview.Heading", font=tkfont.nametofont("TkHeadingFont"))
+    except tk.TclError:
+        pass
+
 
 try:
     RESAMPLE_FILTER = Image.Resampling.BILINEAR
 except AttributeError:
     RESAMPLE_FILTER = Image.BILINEAR
+
+
+def _safe_float(value: str | None) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _detect_ui_scale_from_env() -> Optional[float]:
+    """
+    GNOME/Wayland 系でよく使われる環境変数から UI スケール（96DPI=1.0 基準）を推定する。
+    - 150% の場合、概ね 1.5 が得られる想定。
+    """
+    gdk_scale = _safe_float(os.environ.get("GDK_SCALE"))
+    gdk_dpi_scale = _safe_float(os.environ.get("GDK_DPI_SCALE"))
+    if gdk_scale is not None or gdk_dpi_scale is not None:
+        scale = (gdk_scale or 1.0) * (gdk_dpi_scale or 1.0)
+        if 0.5 <= scale <= 4.0:
+            return scale
+
+    qt_scale = _safe_float(os.environ.get("QT_SCALE_FACTOR"))
+    if qt_scale is not None and 0.5 <= qt_scale <= 4.0:
+        return qt_scale
+
+    return None
+
+
+def _detect_dpi_from_xrdb() -> Optional[float]:
+    """
+    X11 系で設定されることがある Xft.dpi を xrdb から読む。
+    例: Xft.dpi: 144
+    """
+    try:
+        out = subprocess.check_output(
+            ["xrdb", "-query"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+
+    m = re.search(r"Xft\.dpi:\s*([0-9.]+)", out)
+    if not m:
+        return None
+
+    dpi = _safe_float(m.group(1))
+    if dpi is None:
+        return None
+    if 50.0 <= dpi <= 400.0:
+        return dpi
+    return None
+
+
+def configure_hidpi(root: tk.Tk) -> float:
+    """
+    Ubuntu(4K/150% 等)で Tkinter がスケールを拾い損ねるケースに備え、
+    - UI スケール（96DPI=1.0 基準）を推定
+    - tk scaling（px/point）を設定
+    を行う。
+
+    返り値:
+        ui_scale: 96DPI=1.0 の相対スケール。150% なら 1.5。
+    """
+    # 手動上書き（必要なら環境変数で固定できるようにする）
+    # 例: GIF_ANIMATOR_UI_SCALE=1.5
+    override = _safe_float(os.environ.get("GIF_ANIMATOR_UI_SCALE"))
+    if override is not None and 0.5 <= override <= 4.0:
+        ui_scale = override
+    else:
+        ui_scale = _detect_ui_scale_from_env()
+        if ui_scale is None:
+            dpi = _detect_dpi_from_xrdb()
+            if dpi is None:
+                try:
+                    dpi = float(root.winfo_fpixels("1i"))  # pixels per inch
+                except tk.TclError:
+                    dpi = 96.0
+            ui_scale = dpi / 96.0
+
+    ui_scale = max(0.75, min(ui_scale, 3.0))
+
+    # Tk の scaling は「1 point(1/72 inch) あたり何ピクセルか」
+    # 基準 96DPI の場合は 96/72 = 1.333...
+    # 150% (=144DPI) なら 144/72 = 2.0
+    tk_scaling = (96.0 / 72.0) * ui_scale
+    try:
+        root.tk.call("tk", "scaling", tk_scaling)
+    except tk.TclError:
+        # 環境によっては失敗することがあるため握りつぶす（UI は ui_scale 側でも調整する）
+        pass
+
+    return ui_scale
 
 
 @dataclass
@@ -35,11 +263,19 @@ class GifAnimatorApp:
         "Time (New-Old)",
     )
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, ui_scale: float = 1.0) -> None:
         self.root = root
+        self.ui_scale = ui_scale
+
+        # ピクセル固定値を UI スケールで扱うための補助
+        def s(value: int | float) -> int:
+            return max(1, int(round(value * self.ui_scale)))
+
+        self.s = s  # helper をインスタンスに保持
+
         self.root.title("GIF Animator")
-        self.root.geometry("1200x760")
-        self.root.minsize(980, 640)
+        self.root.geometry(f"{self.s(1200)}x{self.s(760)}")
+        self.root.minsize(self.s(980), self.s(640))
 
         self.current_file: Optional[Path] = None
         self.current_directory: Optional[Path] = None
@@ -59,16 +295,21 @@ class GifAnimatorApp:
         self.sort_var = tk.StringVar(value=self.SORT_OPTIONS[0])
         self._updating_slider = False
 
+        # リサイズ検出の閾値もスケールさせる（高 DPI で過敏になりすぎないように）
+        self.resize_epsilon_px = max(2, self.s(self.RESIZE_EPSILON_PX))
+        self.dnd_enabled = False
+
         self._build_ui()
+        self._configure_drag_and_drop()
         self._bind_shortcuts()
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        app_frame = ttk.Frame(self.root, padding=8)
+        app_frame = ttk.Frame(self.root, padding=self.s(8))
         app_frame.grid(row=0, column=0, sticky="nsew")
-        app_frame.columnconfigure(0, weight=0, minsize=340)
+        app_frame.columnconfigure(0, weight=0, minsize=self.s(340))
         app_frame.columnconfigure(1, weight=1)
         app_frame.rowconfigure(0, weight=1)
 
@@ -77,22 +318,22 @@ class GifAnimatorApp:
 
         self.status_var = tk.StringVar(value="GIFファイルを開いてください")
         status = ttk.Label(self.root, textvariable=self.status_var, anchor="w")
-        status.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        status.grid(row=1, column=0, sticky="ew", padx=self.s(8), pady=(0, self.s(8)))
 
     def _build_sidebar(self, parent: ttk.Frame) -> None:
-        sidebar = ttk.LabelFrame(parent, text="Directory GIFs", padding=8)
-        sidebar.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        sidebar = ttk.LabelFrame(parent, text="Directory GIFs", padding=self.s(8))
+        sidebar.grid(row=0, column=0, sticky="nsew", padx=(0, self.s(8)))
         sidebar.columnconfigure(0, weight=1)
         sidebar.rowconfigure(2, weight=1)
 
         open_btn = ttk.Button(sidebar, text="GIFを開く", command=self.select_gif_file)
         self._enable_press_to_activate(open_btn, self.select_gif_file)
-        open_btn.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        open_btn.grid(row=0, column=0, sticky="ew", pady=(0, self.s(8)))
 
         sort_row = ttk.Frame(sidebar)
-        sort_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        sort_row.grid(row=1, column=0, sticky="ew", pady=(0, self.s(8)))
         sort_row.columnconfigure(1, weight=1)
-        ttk.Label(sort_row, text="並び替え").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(sort_row, text="並び替え").grid(row=0, column=0, sticky="w", padx=(0, self.s(6)))
 
         sort_combo = ttk.Combobox(
             sort_row,
@@ -114,9 +355,9 @@ class GifAnimatorApp:
         self.file_tree.heading("name", text="Name")
         self.file_tree.heading("mtime", text="Modified")
         self.file_tree.heading("size", text="Size")
-        self.file_tree.column("name", width=170, anchor="w")
-        self.file_tree.column("mtime", width=120, anchor="w")
-        self.file_tree.column("size", width=70, anchor="e")
+        self.file_tree.column("name", width=self.s(170), anchor="w")
+        self.file_tree.column("mtime", width=self.s(120), anchor="w")
+        self.file_tree.column("size", width=self.s(70), anchor="e")
         self.file_tree.grid(row=2, column=0, sticky="nsew")
         self.file_tree.bind("<Double-1>", self._on_file_double_click)
 
@@ -125,19 +366,19 @@ class GifAnimatorApp:
         tree_scroll.grid(row=2, column=1, sticky="ns")
 
         nav_row = ttk.Frame(sidebar)
-        nav_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        nav_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(self.s(8), 0))
         nav_row.columnconfigure(0, weight=1)
         nav_row.columnconfigure(1, weight=1)
 
         prev_file_btn = ttk.Button(nav_row, text="Prev File", command=lambda: self.open_adjacent_file(-1))
         self._enable_press_to_activate(prev_file_btn, lambda: self.open_adjacent_file(-1))
-        prev_file_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        prev_file_btn.grid(row=0, column=0, sticky="ew", padx=(0, self.s(4)))
         next_file_btn = ttk.Button(nav_row, text="Next File", command=lambda: self.open_adjacent_file(1))
         self._enable_press_to_activate(next_file_btn, lambda: self.open_adjacent_file(1))
-        next_file_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        next_file_btn.grid(row=0, column=1, sticky="ew", padx=(self.s(4), 0))
 
     def _build_viewer(self, parent: ttk.Frame) -> None:
-        viewer = ttk.LabelFrame(parent, text="Preview", padding=8)
+        viewer = ttk.LabelFrame(parent, text="Preview", padding=self.s(8))
         viewer.grid(row=0, column=1, sticky="nsew")
         viewer.columnconfigure(0, weight=1)
         viewer.rowconfigure(0, weight=1)
@@ -147,7 +388,7 @@ class GifAnimatorApp:
         self.image_label.bind("<Configure>", self._on_preview_resize)
 
         controls = ttk.Frame(viewer)
-        controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        controls.grid(row=1, column=0, sticky="ew", pady=(self.s(8), 0))
         controls.columnconfigure(1, weight=1)
 
         playback_row = ttk.Frame(controls)
@@ -156,19 +397,22 @@ class GifAnimatorApp:
         self.play_btn = ttk.Button(playback_row, text="再生", command=self.play)
         self._enable_press_to_activate(self.play_btn, self.play)
         self.play_btn.grid(row=0, column=0, sticky="ew")
+
         self.pause_btn = ttk.Button(playback_row, text="停止", command=self.pause)
         self._enable_press_to_activate(self.pause_btn, self.pause)
-        self.pause_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.pause_btn.grid(row=0, column=1, sticky="ew", padx=(self.s(6), 0))
+
         prev_frame_btn = ttk.Button(playback_row, text="◀", width=4, command=lambda: self.step_frame(-1))
         self._enable_press_to_activate(prev_frame_btn, lambda: self.step_frame(-1))
-        prev_frame_btn.grid(row=0, column=2, sticky="ew", padx=(12, 0))
+        prev_frame_btn.grid(row=0, column=2, sticky="ew", padx=(self.s(12), 0))
+
         next_frame_btn = ttk.Button(playback_row, text="▶", width=4, command=lambda: self.step_frame(1))
         self._enable_press_to_activate(next_frame_btn, lambda: self.step_frame(1))
-        next_frame_btn.grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        next_frame_btn.grid(row=0, column=3, sticky="ew", padx=(self.s(6), 0))
 
         speed_frame = ttk.Frame(playback_row)
-        speed_frame.grid(row=0, column=4, sticky="e", padx=(16, 0))
-        ttk.Label(speed_frame, text="速度").grid(row=0, column=0, padx=(0, 6))
+        speed_frame.grid(row=0, column=4, sticky="e", padx=(self.s(16), 0))
+        ttk.Label(speed_frame, text="速度").grid(row=0, column=0, padx=(0, self.s(6)))
         ttk.Radiobutton(speed_frame, text="0.5x", variable=self.speed_var, value=0.5).grid(row=0, column=1)
         ttk.Radiobutton(speed_frame, text="1x", variable=self.speed_var, value=1.0).grid(row=0, column=2)
         ttk.Radiobutton(speed_frame, text="2x", variable=self.speed_var, value=2.0).grid(row=0, column=3)
@@ -182,7 +426,7 @@ class GifAnimatorApp:
             command=self._on_slider_change,
             resolution=1,
         )
-        self.frame_slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 2))
+        self.frame_slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(self.s(8), self.s(2)))
 
         info_row = ttk.Frame(controls)
         info_row.grid(row=2, column=0, columnspan=2, sticky="ew")
@@ -190,6 +434,7 @@ class GifAnimatorApp:
 
         self.frame_info_var = tk.StringVar(value="Frame: - / -")
         ttk.Label(info_row, textvariable=self.frame_info_var).grid(row=0, column=0, sticky="w")
+
         save_frame_btn = ttk.Button(info_row, text="現在フレームを保存", command=self.save_current_frame)
         self._enable_press_to_activate(save_frame_btn, self.save_current_frame)
         save_frame_btn.grid(row=0, column=1, sticky="e")
@@ -197,7 +442,33 @@ class GifAnimatorApp:
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Left>", lambda _: self.step_frame(-1))
         self.root.bind("<Right>", lambda _: self.step_frame(1))
+        self.root.bind("<Up>", lambda _: self.open_adjacent_file(-1))
+        self.root.bind("<Down>", lambda _: self.open_adjacent_file(1))
         self.root.bind("<space>", self._toggle_play_pause)
+
+    def _configure_drag_and_drop(self) -> None:
+        if not DND_IMPORT_AVAILABLE:
+            return
+
+        if not hasattr(self.root, "drop_target_register"):
+            return
+
+        try:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<DropEnter>>", self._on_drop_enter, add="+")
+            self.root.dnd_bind("<<DropPosition>>", self._on_drop_position, add="+")
+            self.root.dnd_bind("<<Drop>>", self._on_drop_files, add="+")
+
+            self.image_label.drop_target_register(DND_FILES)
+            self.image_label.dnd_bind("<<DropEnter>>", self._on_drop_enter, add="+")
+            self.image_label.dnd_bind("<<DropPosition>>", self._on_drop_position, add="+")
+            self.image_label.dnd_bind("<<Drop>>", self._on_drop_files, add="+")
+
+            self.image_label.drag_source_register(1, DND_FILES)
+            self.image_label.dnd_bind("<<DragInitCmd>>", self._on_drag_init, add="+")
+            self.dnd_enabled = True
+        except tk.TclError:
+            self.dnd_enabled = False
 
     def _enable_press_to_activate(self, button: ttk.Button, callback) -> None:
         # tkinter の標準ボタンは release 時に command 実行されるため、
@@ -217,11 +488,73 @@ class GifAnimatorApp:
         button.bind("<ButtonRelease-1>", on_release, add="+")
         button.bind("<Leave>", lambda _: button.state(["!pressed"]), add="+")
 
-    def _toggle_play_pause(self, _: tk.Event) -> None:
+    def _split_dnd_items(self, raw_data: str) -> list[str]:
+        if not raw_data:
+            return []
+
+        try:
+            return [item for item in self.root.tk.splitlist(raw_data) if item]
+        except tk.TclError:
+            return [raw_data]
+
+    def _coerce_dropped_item_to_path(self, item: str) -> Optional[Path]:
+        value = item.strip()
+        if not value:
+            return None
+
+        parsed = urlparse(value)
+        if parsed.scheme == "file":
+            path_text = unquote(parsed.path or "")
+            if parsed.netloc and parsed.netloc != "localhost":
+                path_text = f"//{parsed.netloc}{path_text}"
+            if sys.platform.startswith("win") and re.match(r"^/[A-Za-z]:", path_text):
+                path_text = path_text[1:]
+            value = path_text
+
+        return Path(value)
+
+    def _find_dropped_gif(self, raw_data: str) -> Optional[Path]:
+        for item in self._split_dnd_items(raw_data):
+            path = self._coerce_dropped_item_to_path(item)
+            if path is None:
+                continue
+
+            candidate = path.expanduser()
+            if candidate.suffix.lower() != ".gif":
+                continue
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            return candidate.resolve()
+        return None
+
+    def _on_drop_enter(self, _: object) -> str:
+        return COPY
+
+    def _on_drop_position(self, _: object) -> str:
+        return COPY
+
+    def _on_drop_files(self, event: object) -> str:
+        dropped_gif = self._find_dropped_gif(getattr(event, "data", ""))
+        if dropped_gif is None:
+            self.status_var.set("GIFファイルをドロップしてください。")
+            return NONE
+
+        self.load_gif(dropped_gif)
+        return COPY
+
+    def _on_drag_init(self, _: object) -> tuple[str, str, str]:
+        if self.current_file is None or not self.current_file.exists():
+            return (NONE, DND_FILES, "")
+
+        dnd_data = self.root.tk.call("list", str(self.current_file))
+        return (COPY, DND_FILES, dnd_data)
+
+    def _toggle_play_pause(self, _: tk.Event) -> str:
         if self.playing:
             self.pause()
         else:
             self.play()
+        return "break"
 
     def select_gif_file(self) -> None:
         initial_dir = str(self.current_directory) if self.current_directory else str(Path.cwd())
@@ -304,7 +637,7 @@ class GifAnimatorApp:
         width = self.image_label.winfo_width()
         height = self.image_label.winfo_height()
         if width <= 1 or height <= 1:
-            return (640, 480)
+            return (self.s(640), self.s(480))
         return (width, height)
 
     def _get_or_create_photo(self, frame_index: int) -> ImageTk.PhotoImage:
@@ -351,7 +684,7 @@ class GifAnimatorApp:
         if self.preview_size != (0, 0):
             width_delta = abs(new_size[0] - self.preview_size[0])
             height_delta = abs(new_size[1] - self.preview_size[1])
-            if width_delta <= self.RESIZE_EPSILON_PX and height_delta <= self.RESIZE_EPSILON_PX:
+            if width_delta <= self.resize_epsilon_px and height_delta <= self.resize_epsilon_px:
                 return
 
         self.preview_size = new_size
@@ -510,8 +843,25 @@ class GifAnimatorApp:
 
 
 def main() -> None:
-    root = tk.Tk()
-    app = GifAnimatorApp(root)
+    if DND_IMPORT_AVAILABLE and TkinterDnD is not None:
+        try:
+            root = TkinterDnD.Tk()
+        except (RuntimeError, tk.TclError):
+            root = tk.Tk()
+    else:
+        root = tk.Tk()
+
+    ui_scale = configure_hidpi(root)
+    ui_font_family = _select_ui_font_family(root)
+    fixed_font_family = _select_fixed_font_family(root)
+    apply_font_scaling(
+        root,
+        text_scale=ui_scale,
+        ui_font_family=ui_font_family,
+        fixed_font_family=fixed_font_family,
+    )
+
+    app = GifAnimatorApp(root, ui_scale=ui_scale)
     if app.current_file:
         app.load_gif(app.current_file)
     root.mainloop()
